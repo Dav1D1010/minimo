@@ -1,0 +1,303 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "<unk>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 1,
+      "content": "<s>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 2,
+      "content": "</s>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 3,
+      "content": "<pad>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 4,
+      "content": "<user>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 5,
+      "content": "<bot>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "ByteLevel",
+    "add_prefix_space": false,
+    "trim_offsets": true,
+    "use_regex": true
+  },
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "BPE",
+    "dropout": null,
+    "unk_token": "<unk>",
+    "continuing_subword_prefix": null,
+    "end_of_word_suffix": null,
+    "fuse_unk": false,
+    "byte_fallback": false,
+    "ignore_merges": false,
+    "vocab": {
+      "<unk>": 0,
+      "<s>": 1,
+      "</s>": 2,
+      "<pad>": 3,
+      "<user>": 4,
+      "<bot>": 5,
+      "'": 6,
+      ".": 7,
+      "A": 8,
+      "B": 9,
+      "E": 10,
+      "M": 11,
+      "P": 12,
+      "T": 13,
+      "a": 14,
+      "d": 15,
+      "e": 16,
+      "f": 17,
+      "i": 18,
+      "k": 19,
+      "l": 20,
+      "m": 21,
+      "n": 22,
+      "o": 23,
+      "r": 24,
+      "s": 25,
+      "t": 26,
+      "z": 27,
+      "Ġ": 28,
+      "ni": 29,
+      "'s": 30,
+      "BP": 31,
+      "Mi": 32,
+      "To": 33,
+      "al": 34,
+      "as": 35,
+      "at": 36,
+      "dat": 37,
+      "er": 38,
+      "es": 39,
+      "et": 40,
+      "eni": 41,
+      "fo": 42,
+      "keni": 43,
+      "mo": 44,
+      "mal": 45,
+      "smal": 46,
+      "tes": 47,
+      "zer": 48,
+      "ĠBP": 49,
+      "ĠMi": 50,
+      "ĠTo": 51,
+      "Ġdat": 52,
+      "Ġfo": 53,
+      "Ġsmal": 54,
+      "Ġtes": 55,
+      "nimo": 56,
+      "aset": 57,
+      "kenizer": 58,
+      "ĠBPE": 59,
+      "ĠMinimo": 60,
+      "ĠTokenizer": 61,
+      "Ġdataset": 62,
+      "Ġfor": 63,
+      "Ġsmall": 64,
+      "Ġtest": 65,
+      "ĠA": 66
+    },
+    "merges": [
+      [
+        "n",
+        "i"
+      ],
+      [
+        "'",
+        "s"
+      ],
+      [
+        "B",
+        "P"
+      ],
+      [
+        "M",
+        "i"
+      ],
+      [
+        "T",
+        "o"
+      ],
+      [
+        "a",
+        "l"
+      ],
+      [
+        "a",
+        "s"
+      ],
+      [
+        "a",
+        "t"
+      ],
+      [
+        "d",
+        "at"
+      ],
+      [
+        "e",
+        "r"
+      ],
+      [
+        "e",
+        "s"
+      ],
+      [
+        "e",
+        "t"
+      ],
+      [
+        "e",
+        "ni"
+      ],
+      [
+        "f",
+        "o"
+      ],
+      [
+        "k",
+        "eni"
+      ],
+      [
+        "m",
+        "o"
+      ],
+      [
+        "m",
+        "al"
+      ],
+      [
+        "s",
+        "mal"
+      ],
+      [
+        "t",
+        "es"
+      ],
+      [
+        "z",
+        "er"
+      ],
+      [
+        "Ġ",
+        "BP"
+      ],
+      [
+        "Ġ",
+        "Mi"
+      ],
+      [
+        "Ġ",
+        "To"
+      ],
+      [
+        "Ġ",
+        "dat"
+      ],
+      [
+        "Ġ",
+        "fo"
+      ],
+      [
+        "Ġ",
+        "smal"
+      ],
+      [
+        "Ġ",
+        "tes"
+      ],
+      [
+        "ni",
+        "mo"
+      ],
+      [
+        "as",
+        "et"
+      ],
+      [
+        "keni",
+        "zer"
+      ],
+      [
+        "ĠBP",
+        "E"
+      ],
+      [
+        "ĠMi",
+        "nimo"
+      ],
+      [
+        "ĠTo",
+        "kenizer"
+      ],
+      [
+        "Ġdat",
+        "aset"
+      ],
+      [
+        "Ġfo",
+        "r"
+      ],
+      [
+        "Ġsmal",
+        "l"
+      ],
+      [
+        "Ġtes",
+        "t"
+      ],
+      [
+        "Ġ",
+        "A"
+      ]
+    ]
+  }
+}
