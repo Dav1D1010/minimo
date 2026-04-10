@@ -19,10 +19,10 @@ GRAD_ACCUM_STEPS = 16 # Effective Batch Size = 16. Averages gradients over 16 pa
 
 # --- Step Calculations for Effective Batch Size 16 ---
 # 1. Pretraining (~2.11M examples in TinyStories):
-#    1 Epoch = 2,119,719 / 16 = 132,482 steps. 
-#    At ~1 second per step, 50,000 steps takes ~14 hours and covers a solid chunk of the dataset.
-PRETRAIN_STEPS = 50000
-
+#    1 Epoch = 2,119,719 / 16 = 132,482 steps.
+#    At ~0.8 second per step, 100,000 steps covers a large chunk of the dataset
+#    and provides a stronger foundational understanding.
+PRETRAIN_STEPS = 100000
 # 2. SFT (~75K examples in Magicoder):
 #    1 Epoch = 75,197 / 16 = ~4,700 steps.
 #    Training for exactly 1 epoch (~1.3 hours) prevents overfitting on instruction formats.
@@ -80,15 +80,15 @@ def pretrain_model():
     vocab_size = tokenizer.get_vocab_size()
     print(f"Loaded tokenizer with vocab size: {vocab_size}")
 
-    # Initialize model optimized for 8GB VRAM
-    model = MinimoModel(vocab_size=vocab_size, dim=768, n_layers=16, n_heads=12, n_kv_heads=4, max_seq_len=MAX_SEQ_LEN)
+    # Initialize model optimized for 8GB VRAM (updated to ~217M parameters)
+    model = MinimoModel(vocab_size=vocab_size, dim=896, n_layers=18, n_heads=14, n_kv_heads=2, max_seq_len=MAX_SEQ_LEN)
     model.to(DEVICE)
     
     print("Loading dataset: roneneldan/TinyStories (This may download data to ../Data)")
     dataset = load_dataset("roneneldan/TinyStories", split="train", cache_dir=HF_CACHE)
     
     # Take a small subset to match steps
-    dataset = dataset.select(range(BATCH_SIZE * GRAD_ACCUM_STEPS * PRETRAIN_STEPS * 2))
+    dataset = dataset.select(range(min(len(dataset), BATCH_SIZE * GRAD_ACCUM_STEPS * PRETRAIN_STEPS * 2)))
     
     dataloader = DataLoader(
         dataset, 

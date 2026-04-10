@@ -33,9 +33,9 @@
   "revision": null,
   "target_modules": [
     "wq",
+    "wk",
     "wo",
-    "wv",
-    "wk"
+    "wv"
   ],
   "target_parameters": null,
   "task_type": null,

@@ -140,19 +140,19 @@ class MinimoModel(nn.Module):
     """
     The main Causal LM architecture.
     
-    Optimized 105M Parameter Setup for RTX 5060 (8GB VRAM):
-    - `n_layers` = 16: Deeper networks generally learn better reasoning representations than wider, shallower ones.
-    - `dim` (d_model) = 768: Divisible by 12 (heads) to give a clean head_dim of 64.
-    - `n_heads` = 12: Query heads.
-    - `n_kv_heads` = 4: Using Grouped-Query Attention (3:1 ratio) to massively save on memory and parameter count.
-    - `intermediate_dim` = 3072: Exact 4x scaling of d_model for the FFN layer.
+    Optimized ~217M Parameter Setup for RTX 5060 (8GB VRAM):
+    - `n_layers` = 18: Increased depth for better reasoning and abstraction.
+    - `dim` (d_model) = 896: Increased width for a larger knowledge capacity (Divisible by 14 heads = 64 head_dim).
+    - `n_heads` = 14: Query heads.
+    - `n_kv_heads` = 2: Extreme Grouped-Query Attention (7:1 ratio) to keep memory spikes low.
+    - `intermediate_dim` = 3584: Exact 4x scaling of d_model for the FFN layer.
     
-    Total parameters: ~105.6 Million.
-    Expected VRAM footprint for states (AdamW + BF16 Mixed Precision): ~1.9 GB.
-    This leaves ~6 GB of VRAM completely free for activations (Batch Size and Sequence Length),
-    which is highly comfortable for an 8GB GPU, especially if Gradient Checkpointing is used.
+    Total parameters: ~217.5 Million.
+    Expected VRAM footprint for states (AdamW + BF16 Mixed Precision): ~3.0 GB.
+    This leaves ~5 GB of VRAM completely free for activations (Batch Size and Sequence Length),
+    which is still very safe for an 8GB GPU while significantly pushing model capability.
     """
-    def __init__(self, vocab_size, dim=768, n_layers=16, n_heads=12, n_kv_heads=4, max_seq_len=2048):
+    def __init__(self, vocab_size, dim=896, n_layers=18, n_heads=14, n_kv_heads=2, max_seq_len=2048):
         super().__init__()
         self.tok_embeddings = nn.Embedding(vocab_size, dim)
         
