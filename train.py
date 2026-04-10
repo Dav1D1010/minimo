@@ -1,393 +1,456 @@
 import os
+
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from tokenizers import Tokenizer
 from datasets import load_dataset
-from model import MinimoModel
 from peft import LoraConfig, get_peft_model
+from tokenizers import Tokenizer
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Setup cache dir to external Projects/Data as requested
+from model import MinimoConfig, MinimoForCausalLM
+
+
+# The dataset cache is redirected outside the repository so repeated runs do not
+# keep bloating the project folder with downloaded training data.
 HF_CACHE = os.path.abspath(os.path.join(os.path.dirname(__file__), "../Data"))
 os.environ["HF_DATASETS_CACHE"] = HF_CACHE
 os.makedirs(HF_CACHE, exist_ok=True)
 
-# Hyperparameters for RTX 5060 (8GB VRAM) -> ~15+ Hours Total Training Time
-BATCH_SIZE = 1 # Hardware limit for per-device batch
-GRAD_ACCUM_STEPS = 16 # Effective Batch Size = 16. Averages gradients over 16 passes before updating.
 
-# --- Step Calculations for Effective Batch Size 16 ---
-# 1. Pretraining (~2.11M examples in TinyStories):
-#    1 Epoch = 2,119,719 / 16 = 132,482 steps.
-#    At ~0.8 second per step, 100,000 steps covers a large chunk of the dataset
-#    and provides a stronger foundational understanding.
+# The training loop is sized around an RTX 5060 with 8 GB of VRAM.
+# `BATCH_SIZE=1` is the physically safe micro-batch size that fits in memory.
+# `GRAD_ACCUM_STEPS=16` lets the optimizer see 16 examples per update anyway,
+# which produces an effective batch size of 16 without needing 16 examples in
+# memory at the same time.
+BATCH_SIZE = 1
+GRAD_ACCUM_STEPS = 16
+
+
+# The project uses a three-stage training schedule.
+# `PRETRAIN_STEPS=100000` is long enough to expose the model to a substantial
+# slice of TinyStories while still being achievable on the target hardware.
 PRETRAIN_STEPS = 100000
-# 2. SFT (~75K examples in Magicoder):
-#    1 Epoch = 75,197 / 16 = ~4,700 steps.
-#    Training for exactly 1 epoch (~1.3 hours) prevents overfitting on instruction formats.
+
+# `SFT_STEPS=4700` is roughly one pass over the chosen instruction dataset at
+# the configured effective batch size. The intent is adaptation, not memorizing
+# the dataset word-for-word through many repeated epochs.
 SFT_STEPS = 4700
 
-# 3. DPO (~6.7K examples in dpo-mix-7k):
-#    1 Epoch = 6,750 / 16 = ~422 steps.
-#    Alignment needs very few steps. 1 epoch (~15-20 minutes) is perfect.
+# `DPO_STEPS=422` is a short alignment pass. Preference tuning usually needs a
+# gentler touch than pretraining because it is shaping behavior, not teaching
+# language from scratch.
 DPO_STEPS = 422
 
+
+# `MAX_SEQ_LEN=256` keeps the training examples short enough to be affordable.
+# Sequence length has a large cost in transformers because attention scales with
+# roughly the square of the context length.
 MAX_SEQ_LEN = 256
+
+# `LEARNING_RATE=5e-4` is a practical small-model baseline for AdamW. It is
+# high enough to make progress on a compact network, but not so large that early
+# training becomes wildly unstable.
 LEARNING_RATE = 5e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+
+def autocast_context():
+    """
+    Pick a mixed-precision mode that matches the current hardware.
+
+    CUDA GPUs benefit substantially from float16 or bfloat16 during training
+    because the model fits more comfortably in memory and matrix math usually
+    runs faster. CPU execution falls back to a no-op context manager.
+    """
+    if DEVICE == "cuda":
+        autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return torch.autocast(device_type="cuda", dtype=autocast_dtype)
+    return torch.autocast(device_type="cpu", enabled=False)
+
+
 def load_custom_tokenizer():
+    """
+    Load the locally trained tokenizer and guarantee a padding token exists.
+
+    Padding is necessary because PyTorch batches need rectangular tensors, but
+    natural language examples rarely have the same length. Adding `<pad>` keeps
+    the shape regular while letting the loss function ignore the filler tokens.
+    """
     tokenizer_path = "minimo_tokenizer.json"
     if not os.path.exists(tokenizer_path):
         raise FileNotFoundError("Tokenizer not found. Run 'python main.py --mode tokenize' first.")
+
     tokenizer = Tokenizer.from_file(tokenizer_path)
-    # The padding id might be missing, assume 3 (or <pad>)
     pad_id = tokenizer.token_to_id("<pad>")
+
     if pad_id is None:
         tokenizer.add_special_tokens(["<pad>"])
         pad_id = tokenizer.token_to_id("<pad>")
+
     return tokenizer, pad_id
+
+
+def pad_or_truncate(token_ids, pad_id):
+    """
+    Force every token sequence to exactly `MAX_SEQ_LEN`.
+
+    Truncation keeps compute bounded, while padding keeps the batch shape legal.
+    This is a common compromise in small educational projects where full dynamic
+    packing would add a lot of extra code complexity.
+    """
+    token_ids = token_ids[:MAX_SEQ_LEN]
+    return token_ids + [pad_id] * (MAX_SEQ_LEN - len(token_ids))
+
 
 def collate_fn_pretrain(batch, tokenizer, pad_id):
     """
-    Collate function for pretraining: pads sequences to max length.
+    Convert raw TinyStories text into fixed-length token tensors.
+
+    For plain causal language-model pretraining, the input tokens and target
+    tokens start out identical. The model code shifts them internally so each
+    position learns to predict the next token.
     """
     texts = [item["text"] for item in batch]
     encodings = tokenizer.encode_batch(texts)
-    
-    input_ids = []
-    for enc in encodings:
-        ids = enc.ids[:MAX_SEQ_LEN]
-        # Pad if necessary
-        ids = ids + [pad_id] * (MAX_SEQ_LEN - len(ids))
-        input_ids.append(ids)
-        
+    input_ids = [pad_or_truncate(encoding.ids, pad_id) for encoding in encodings]
+
     input_ids = torch.tensor(input_ids, dtype=torch.long)
-    # Targets for causal LM are shifted inputs
     targets = input_ids.clone()
     return input_ids, targets
+
 
 def pretrain_model():
     """
-    Pretrains the ~105M parameter base model on TinyStories.
-    Executes a custom PyTorch training loop.
+    Train the base language model on TinyStories.
+
+    TinyStories is a good starter corpus for a compact model because the text is
+    clean, abundant, and simple enough for a smaller network to model without
+    requiring giant compute budgets.
     """
-    print(f"Using HF Cache directory: {HF_CACHE}")
-    print("Initializing Minimo Causal LM (~105.6M params)...")
-    
+    print(f"Using HF cache directory: {HF_CACHE}")
+
     tokenizer, pad_id = load_custom_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
-    print(f"Loaded tokenizer with vocab size: {vocab_size}")
+    print(f"Loaded tokenizer with vocabulary size: {vocab_size}")
 
-    # Initialize model optimized for 8GB VRAM (updated to ~217M parameters)
-    model = MinimoModel(vocab_size=vocab_size, dim=896, n_layers=18, n_heads=14, n_kv_heads=2, max_seq_len=MAX_SEQ_LEN)
-    model.to(DEVICE)
-    
-    print("Loading dataset: roneneldan/TinyStories (This may download data to ../Data)")
-    dataset = load_dataset("roneneldan/TinyStories", split="train", cache_dir=HF_CACHE)
-    
-    # Take a small subset to match steps
-    dataset = dataset.select(range(min(len(dataset), BATCH_SIZE * GRAD_ACCUM_STEPS * PRETRAIN_STEPS * 2)))
-    
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=True, 
-        collate_fn=lambda b: collate_fn_pretrain(b, tokenizer, pad_id)
+    print("Initializing the base Minimo model...")
+    config = MinimoConfig(
+        vocab_size=vocab_size,
+        pad_token_id=pad_id,
+        max_position_embeddings=MAX_SEQ_LEN,
     )
-    
+    model = MinimoForCausalLM(config)
+    model.to(DEVICE)
+
+    print("Loading dataset: roneneldan/TinyStories")
+    dataset = load_dataset("roneneldan/TinyStories", split="train", cache_dir=HF_CACHE)
+
+    # A capped subset keeps the dataloader from walking far beyond the number of
+    # items needed for the requested number of optimizer steps.
+    usable_examples = BATCH_SIZE * GRAD_ACCUM_STEPS * PRETRAIN_STEPS * 2
+    dataset = dataset.select(range(min(len(dataset), usable_examples)))
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=lambda batch: collate_fn_pretrain(batch, tokenizer, pad_id),
+    )
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    
-    print(f"Starting Pretraining for {PRETRAIN_STEPS} optimization steps...")
+
+    print(f"Starting pretraining for {PRETRAIN_STEPS} optimizer steps...")
     model.train()
-    
     step = 0
-    accum_loss = 0
+    accumulated_loss = 0.0
     optimizer.zero_grad()
-    
     progress = tqdm(total=PRETRAIN_STEPS, desc="Pretraining")
-    
-    for i, (input_ids, targets) in enumerate(dataloader):
+
+    for batch_index, (input_ids, targets) in enumerate(dataloader):
         if step >= PRETRAIN_STEPS:
             break
-            
-        input_ids, targets = input_ids.to(DEVICE), targets.to(DEVICE)
-        
-        # Mixed precision (BF16 or FP16) to save VRAM
-        with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-            # Shift targets for causal LM: model output[:-1] predicts target[1:]
-            logits, _ = model(input_ids)
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_targets = targets[..., 1:].contiguous()
-            
-            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_targets.view(-1), ignore_index=pad_id)
-            loss = loss / GRAD_ACCUM_STEPS
-            
+
+        input_ids = input_ids.to(DEVICE)
+        targets = targets.to(DEVICE)
+
+        with autocast_context():
+            outputs = model(input_ids=input_ids, labels=targets)
+            loss = outputs["loss"] / GRAD_ACCUM_STEPS
+
         loss.backward()
-        accum_loss += loss.item()
-        
-        if (i + 1) % GRAD_ACCUM_STEPS == 0:
+        accumulated_loss += loss.item()
+
+        if (batch_index + 1) % GRAD_ACCUM_STEPS == 0:
             optimizer.step()
             optimizer.zero_grad()
-            
+
             progress.update(1)
-            progress.set_postfix({"loss": accum_loss})
-            
+            progress.set_postfix({"loss": accumulated_loss})
             step += 1
-            accum_loss = 0
-            
+            accumulated_loss = 0.0
+
     progress.close()
-    
-    # Save the base model weights
-    os.makedirs("checkpoints", exist_ok=True)
-    torch.save(model.state_dict(), "checkpoints/minimo_base.pt")
-    print("Pretraining complete. Saved base model to checkpoints/minimo_base.pt")
+
+    os.makedirs("checkpoints/hf_minimo_base", exist_ok=True)
+    model.save_pretrained("checkpoints/hf_minimo_base")
+    print("Pretraining complete. Saved the base model to checkpoints/hf_minimo_base")
     return model
+
 
 def collate_fn_sft(batch, tokenizer, pad_id):
     """
-    Format Magicoder dataset for SFT.
+    Format instruction-following examples into a simple chat template.
+
+    The explicit `<user>` and `<bot>` markers teach the model where the prompt
+    ends and the expected answer begins. Even a tiny chat format like this gives
+    the model clearer structure than concatenating the fields without markers.
     """
-    # Magicoder contains 'problem' and 'solution'
     prompts = [f"<user> {item['problem']} <bot> {item['solution']}" for item in batch]
     encodings = tokenizer.encode_batch(prompts)
-    
-    input_ids = []
-    for enc in encodings:
-        ids = enc.ids[:MAX_SEQ_LEN]
-        ids = ids + [pad_id] * (MAX_SEQ_LEN - len(ids))
-        input_ids.append(ids)
-        
+    input_ids = [pad_or_truncate(encoding.ids, pad_id) for encoding in encodings]
+
     input_ids = torch.tensor(input_ids, dtype=torch.long)
     targets = input_ids.clone()
     return input_ids, targets
 
+
 def fine_tune_sft(model):
     """
-    Executes Supervised Fine-Tuning (SFT) using Magicoder-OSS-Instruct-75K.
-    Applies LoRA via PEFT.
+    Run supervised fine-tuning with LoRA adapters.
+
+    LoRA is used because it drastically reduces the number of trainable weights.
+    Instead of updating the full base model, small low-rank matrices are learned
+    inside selected layers. That makes instruction tuning much cheaper in both
+    memory and storage.
     """
-    print("\nPreparing model for LoRA (Parameter-Efficient Fine-Tuning)...")
-    
+    print("\nPreparing LoRA adapters for supervised fine-tuning...")
+
     lora_config = LoraConfig(
-        r=8, 
-        lora_alpha=32, 
-        target_modules=["wq", "wk", "wv", "wo"], # Target attention projections
+        # `r=8` keeps the adapter compact. Higher rank increases capacity but
+        # also raises memory use and the risk of overfitting small SFT datasets.
+        r=8,
+        # `lora_alpha=32` scales the LoRA update. A value several times larger
+        # than the rank is a common choice that keeps the adapter expressive.
+        lora_alpha=32,
+        # Attention projections are the most influential and cost-effective
+        # places to adapt behavior in many decoder-only models.
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        # `0.05` adds a little regularization so the adapter does not cling too
+        # hard to quirks of the instruction dataset.
         lora_dropout=0.05,
-        bias="none"
+        bias="none",
     )
-    
-    # Wrap custom PyTorch module with PEFT
+
     peft_model = get_peft_model(model, lora_config)
     peft_model.print_trainable_parameters()
-    
+
     tokenizer, pad_id = load_custom_tokenizer()
-    
+
     print("Loading dataset: ise-uiuc/Magicoder-OSS-Instruct-75K")
     dataset = load_dataset("ise-uiuc/Magicoder-OSS-Instruct-75K", split="train", cache_dir=HF_CACHE)
-    
-    # Take enough examples to cover the exact steps requested (padding slightly for shuffle)
-    dataset = dataset.select(range(min(len(dataset), BATCH_SIZE * GRAD_ACCUM_STEPS * SFT_STEPS * 2)))
-    
+    usable_examples = BATCH_SIZE * GRAD_ACCUM_STEPS * SFT_STEPS * 2
+    dataset = dataset.select(range(min(len(dataset), usable_examples)))
+
     dataloader = DataLoader(
-        dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=True, 
-        collate_fn=lambda b: collate_fn_sft(b, tokenizer, pad_id)
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=lambda batch: collate_fn_sft(batch, tokenizer, pad_id),
     )
-    
+
     optimizer = torch.optim.AdamW(peft_model.parameters(), lr=LEARNING_RATE)
-    
-    print(f"Starting SFT for {SFT_STEPS} optimization steps (~1 Epoch)...")
+
+    print(f"Starting supervised fine-tuning for {SFT_STEPS} optimizer steps...")
     peft_model.train()
-    
     step = 0
-    accum_loss = 0
+    accumulated_loss = 0.0
     optimizer.zero_grad()
-    
     progress = tqdm(total=SFT_STEPS, desc="SFT")
-    
-    for i, (input_ids, targets) in enumerate(dataloader):
+
+    for batch_index, (input_ids, targets) in enumerate(dataloader):
         if step >= SFT_STEPS:
             break
-            
-        input_ids, targets = input_ids.to(DEVICE), targets.to(DEVICE)
-        
-        with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-            # The custom model forward takes input_ids
-            # peft_model wraps the base model, so its forward expects what base expects
-            # For causal LM, we calculate loss same as pretrain
-            logits, _ = peft_model(input_ids)
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_targets = targets[..., 1:].contiguous()
-            
-            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_targets.view(-1), ignore_index=pad_id)
-            loss = loss / GRAD_ACCUM_STEPS
-            
+
+        input_ids = input_ids.to(DEVICE)
+        targets = targets.to(DEVICE)
+
+        with autocast_context():
+            outputs = peft_model(input_ids=input_ids, labels=targets)
+            loss = outputs["loss"] / GRAD_ACCUM_STEPS
+
         loss.backward()
-        accum_loss += loss.item()
-        
-        if (i + 1) % GRAD_ACCUM_STEPS == 0:
+        accumulated_loss += loss.item()
+
+        if (batch_index + 1) % GRAD_ACCUM_STEPS == 0:
             optimizer.step()
             optimizer.zero_grad()
-            
+
             progress.update(1)
-            progress.set_postfix({"loss": accum_loss})
-            
+            progress.set_postfix({"loss": accumulated_loss})
             step += 1
-            accum_loss = 0
-            
+            accumulated_loss = 0.0
+
     progress.close()
-    
-    os.makedirs("checkpoints/sft_adapter", exist_ok=True)
-    # Save the PEFT adapter
-    peft_model.save_pretrained("checkpoints/sft_adapter")
-    print("SFT complete. Saved instruction-tuned adapter.")
+
+    os.makedirs("checkpoints/hf_sft_adapter", exist_ok=True)
+    peft_model.save_pretrained("checkpoints/hf_sft_adapter")
+    print("SFT complete. Saved the adapter to checkpoints/hf_sft_adapter")
     return peft_model
+
 
 def get_batch_logprobs(logits, labels, pad_id):
     """
-    Computes log probabilities for DPO loss.
+    Compute sequence log-probabilities for DPO.
+
+    DPO compares how strongly the model prefers a chosen response over a
+    rejected one. Summing token log-probabilities gives one score per sequence,
+    which is what the preference objective needs.
     """
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = labels[..., 1:].contiguous()
-    
+
     log_probs = F.log_softmax(shift_logits, dim=-1)
-    # Gather the log probs of the actual labels
     label_log_probs = torch.gather(log_probs, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
-    
-    # Mask out padding
-    loss_mask = (shift_labels != pad_id)
+
+    loss_mask = shift_labels != pad_id
     label_log_probs = label_log_probs * loss_mask
-    
-    # Sum over sequence length
     return label_log_probs.sum(dim=-1)
+
 
 def collate_fn_dpo(batch, tokenizer, pad_id):
     """
-    Format DPO dataset containing chosen and rejected responses.
+    Build paired chosen and rejected sequences for preference learning.
+
+    The dataset schema can vary a little across examples, so the function is
+    intentionally defensive when extracting the text fields.
     """
-    # dpo-mix-7k typically has 'prompt', 'chosen', 'rejected'
-    # Fallback to general formatting if structure differs slightly
     try:
-        chosen_texts = [f"<user> {item['prompt']} <bot> {item['chosen'][0]['content'] if isinstance(item['chosen'], list) else item['chosen']}" for item in batch]
-        rejected_texts = [f"<user> {item['prompt']} <bot> {item['rejected'][0]['content'] if isinstance(item['rejected'], list) else item['rejected']}" for item in batch]
+        chosen_texts = [
+            f"<user> {item['prompt']} <bot> "
+            f"{item['chosen'][0]['content'] if isinstance(item['chosen'], list) else item['chosen']}"
+            for item in batch
+        ]
+        rejected_texts = [
+            f"<user> {item['prompt']} <bot> "
+            f"{item['rejected'][0]['content'] if isinstance(item['rejected'], list) else item['rejected']}"
+            for item in batch
+        ]
     except KeyError:
-        # Generic fallback
-        chosen_texts = ["<user> " + str(item) + " <bot> chosen" for item in batch]
-        rejected_texts = ["<user> " + str(item) + " <bot> rejected" for item in batch]
-        
-    chosen_enc = tokenizer.encode_batch(chosen_texts)
-    rejected_enc = tokenizer.encode_batch(rejected_texts)
-    
-    chosen_ids, rejected_ids = [], []
-    for c_enc, r_enc in zip(chosen_enc, rejected_enc):
-        c_ids = c_enc.ids[:MAX_SEQ_LEN]
-        c_ids = c_ids + [pad_id] * (MAX_SEQ_LEN - len(c_ids))
-        chosen_ids.append(c_ids)
-        
-        r_ids = r_enc.ids[:MAX_SEQ_LEN]
-        r_ids = r_ids + [pad_id] * (MAX_SEQ_LEN - len(r_ids))
-        rejected_ids.append(r_ids)
-        
-    return torch.tensor(chosen_ids, dtype=torch.long), torch.tensor(rejected_ids, dtype=torch.long)
+        chosen_texts = [f"<user> {item} <bot> chosen" for item in batch]
+        rejected_texts = [f"<user> {item} <bot> rejected" for item in batch]
+
+    chosen_encodings = tokenizer.encode_batch(chosen_texts)
+    rejected_encodings = tokenizer.encode_batch(rejected_texts)
+
+    chosen_ids = [pad_or_truncate(encoding.ids, pad_id) for encoding in chosen_encodings]
+    rejected_ids = [pad_or_truncate(encoding.ids, pad_id) for encoding in rejected_encodings]
+
+    return (
+        torch.tensor(chosen_ids, dtype=torch.long),
+        torch.tensor(rejected_ids, dtype=torch.long),
+    )
+
 
 def align_dpo(model):
     """
-    Direct Preference Optimization (DPO) on dpo-mix-7k.
+    Run Direct Preference Optimization on top of the SFT adapter.
+
+    DPO does not require a reward model. Instead, it compares the policy model
+    against a frozen reference version and nudges the policy toward answers that
+    humans preferred in the dataset.
     """
     print("\nLoading dataset: argilla/dpo-mix-7k")
     dataset = load_dataset("argilla/dpo-mix-7k", split="train", cache_dir=HF_CACHE)
-    
-    # Limit max steps for DPO alignment
-    dpo_steps = DPO_STEPS
-    dataset = dataset.select(range(min(len(dataset), BATCH_SIZE * GRAD_ACCUM_STEPS * dpo_steps * 2)))
-    
+    usable_examples = BATCH_SIZE * GRAD_ACCUM_STEPS * DPO_STEPS * 2
+    dataset = dataset.select(range(min(len(dataset), usable_examples)))
+
     tokenizer, pad_id = load_custom_tokenizer()
-    
+
     dataloader = DataLoader(
-        dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=True, 
-        collate_fn=lambda b: collate_fn_dpo(b, tokenizer, pad_id)
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=lambda batch: collate_fn_dpo(batch, tokenizer, pad_id),
     )
-    
-    # DPO requires a reference model (frozen).
-    # Since we are using PEFT, we can disable the adapter to act as the reference model.
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * 0.1) # Lower LR for DPO
-    
-    beta = 0.1 # DPO temperature
-    print(f"Starting Direct Preference Optimization (DPO) for {dpo_steps} steps...")
-    
+
+    # DPO is deliberately run at a smaller learning rate than pretraining and
+    # SFT because alignment should gently reshape behavior rather than rewrite
+    # the model's language knowledge.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * 0.1)
+
+    # `beta=0.1` controls how strongly the policy is pushed away from the
+    # reference model. A modest beta keeps the preference update from becoming
+    # too aggressive on a relatively small alignment set.
+    beta = 0.1
+
+    print(f"Starting DPO for {DPO_STEPS} optimizer steps...")
     step = 0
-    accum_loss = 0
+    accumulated_loss = 0.0
     optimizer.zero_grad()
-    
-    progress = tqdm(total=dpo_steps, desc="DPO")
-    
-    for i, (chosen_ids, rejected_ids) in enumerate(dataloader):
-        if step >= dpo_steps:
+    progress = tqdm(total=DPO_STEPS, desc="DPO")
+
+    for batch_index, (chosen_ids, rejected_ids) in enumerate(dataloader):
+        if step >= DPO_STEPS:
             break
-            
-        chosen_ids, rejected_ids = chosen_ids.to(DEVICE), rejected_ids.to(DEVICE)
-        
-        with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-            # 1. Get policy log probs (adapter enabled)
-            chosen_logits, _ = model(chosen_ids)
-            rejected_logits, _ = model(rejected_ids)
-            
+
+        chosen_ids = chosen_ids.to(DEVICE)
+        rejected_ids = rejected_ids.to(DEVICE)
+
+        with autocast_context():
+            chosen_logits = model(input_ids=chosen_ids)["logits"]
+            rejected_logits = model(input_ids=rejected_ids)["logits"]
+
             policy_chosen_logps = get_batch_logprobs(chosen_logits, chosen_ids, pad_id)
             policy_rejected_logps = get_batch_logprobs(rejected_logits, rejected_ids, pad_id)
-            
-            # 2. Get reference log probs (adapter disabled)
+
+            # The adapter is disabled temporarily to recover the reference model.
+            # That gives DPO a stable baseline to compare against without having
+            # to keep a second fully separate model in memory.
             with torch.no_grad():
                 with model.disable_adapter():
-                    ref_chosen_logits, _ = model(chosen_ids)
-                    ref_rejected_logits, _ = model(rejected_ids)
-                
+                    ref_chosen_logits = model(input_ids=chosen_ids)["logits"]
+                    ref_rejected_logits = model(input_ids=rejected_ids)["logits"]
+
                 ref_chosen_logps = get_batch_logprobs(ref_chosen_logits, chosen_ids, pad_id)
                 ref_rejected_logps = get_batch_logprobs(ref_rejected_logits, rejected_ids, pad_id)
-            
-            # 3. Calculate DPO Loss
+
             pi_logratios = policy_chosen_logps - policy_rejected_logps
             ref_logratios = ref_chosen_logps - ref_rejected_logps
-            
+
             logits_diff = pi_logratios - ref_logratios
-            loss = -F.logsigmoid(beta * logits_diff).mean()
-            loss = loss / GRAD_ACCUM_STEPS
-            
+            loss = -F.logsigmoid(beta * logits_diff).mean() / GRAD_ACCUM_STEPS
+
         loss.backward()
-        accum_loss += loss.item()
-        
-        if (i + 1) % GRAD_ACCUM_STEPS == 0:
+        accumulated_loss += loss.item()
+
+        if (batch_index + 1) % GRAD_ACCUM_STEPS == 0:
             optimizer.step()
             optimizer.zero_grad()
-            
+
             progress.update(1)
-            progress.set_postfix({"loss": accum_loss})
-            
+            progress.set_postfix({"loss": accumulated_loss})
             step += 1
-            accum_loss = 0
-            
+            accumulated_loss = 0.0
+
     progress.close()
-    
-    os.makedirs("checkpoints/dpo_adapter", exist_ok=True)
-    model.save_pretrained("checkpoints/dpo_adapter")
-    print("DPO complete. Model aligned to human preferences. Saved to checkpoints/dpo_adapter.")
+
+    os.makedirs("checkpoints/hf_dpo_adapter", exist_ok=True)
+    model.save_pretrained("checkpoints/hf_dpo_adapter")
+    print("DPO complete. Saved the aligned adapter to checkpoints/hf_dpo_adapter")
     return model
 
+
 if __name__ == "__main__":
-    print("=== Minimo Full Training Pipeline ===")
-    print("Note: Running the full optimized training pipeline for RTX 5060 (>15 hours total estimated time).")
-    
-    # 1. Pretrain base model
-    base_model = pretrain_model()
-    
-    # 2. SFT using LoRA
+    print("=== Minimo Hugging Face Training Pipeline ===")
+
+    if os.path.exists("hf_minimo"):
+        print("Found an existing base model in 'hf_minimo'. Skipping pretraining.")
+        base_model = MinimoForCausalLM.from_pretrained("hf_minimo")
+        base_model.to(DEVICE)
+    else:
+        base_model = pretrain_model()
+
     sft_model = fine_tune_sft(base_model)
-    
-    # 3. DPO Alignment
-    aligned_model = align_dpo(sft_model)
-    
+    align_dpo(sft_model)
     print("=== Training Pipeline Fully Completed ===")

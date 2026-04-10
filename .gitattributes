@@ -1,2 +1,4 @@
 checkpoints/minimo_base.pt filter=lfs diff=lfs merge=lfs -text
 tokenizer_corpus.txt filter=lfs diff=lfs merge=lfs -text
+hf_minimo/pytorch_model.bin filter=lfs diff=lfs merge=lfs -text
+hf_minimo_merged/model.safetensors filter=lfs diff=lfs merge=lfs -text

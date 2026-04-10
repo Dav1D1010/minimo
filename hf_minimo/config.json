@@ -1,0 +1,20 @@
+{
+  "architectures": [
+    "MinimoForCausalLM"
+  ],
+  "model_type": "minimo",
+  "vocab_size": 6400,
+  "hidden_size": 896,
+  "intermediate_size": 3584,
+  "num_hidden_layers": 18,
+  "num_attention_heads": 14,
+  "num_key_value_heads": 2,
+  "max_position_embeddings": 2048,
+  "rms_norm_eps": 1e-05,
+  "initializer_range": 0.02,
+  "use_cache": true,
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "pad_token_id": 0,
+  "tie_word_embeddings": false
+}
